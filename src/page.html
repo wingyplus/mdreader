@@ -127,6 +127,20 @@
       img {
         max-width: 100%;
       }
+      /* A task list item shows its checkbox in place of the bullet. In a loose list the checkbox
+         sits in the item's first paragraph. */
+      ul > li:has(> input[type="checkbox"]:first-child),
+      ul > li:has(> p:first-child > input[type="checkbox"]:first-child) {
+        list-style: none;
+      }
+      ul > li > input[type="checkbox"]:first-child,
+      ul > li > p:first-child > input[type="checkbox"]:first-child {
+        width: 1em;
+        height: 1em;
+        margin: 0 0.15em 0 -1.4em;
+        vertical-align: -0.125em;
+        accent-color: var(--accent);
+      }
       /* The link to a heading shows while hovering the heading, or always without a hover. */
       .anchor {
         margin-left: 0.4em;
