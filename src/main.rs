@@ -186,9 +186,9 @@ fn read_tree(root: &Path, dir: &str) -> io::Result<Vec<Node>> {
 }
 
 fn is_markdown(name: &str) -> bool {
-    Path::new(name).extension().is_some_and(|ext| {
-        ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
-    })
+    Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"))
 }
 
 fn contains_file(nodes: &[Node], path: &str) -> bool {
