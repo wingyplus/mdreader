@@ -1,0 +1,14 @@
+# Statically linked release build: `cargo release`
+#
+# `--target` is required so that `crt-static` is not applied to host
+# artifacts (build scripts and proc-macros), which cannot be static.
+# The binary is written to target/x86_64-unknown-linux-gnu/release/mdreader.
+[alias]
+release = [
+  "build",
+  "--release",
+  "--target",
+  "x86_64-unknown-linux-gnu",
+  "--config",
+  "target.x86_64-unknown-linux-gnu.rustflags=[\"-C\", \"target-feature=+crt-static\"]",
+]
