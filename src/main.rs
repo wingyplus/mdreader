@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env,
     fmt::Write as _,
     fs,
@@ -243,13 +244,50 @@ fn push_tree(out: &mut String, nodes: &[Node], current: Option<&str>) {
     out.push_str("</ul>\n");
 }
 
-/// Renders markdown to HTML. Fenced code blocks whose info string names a supported language are
-/// syntax highlighted, `mermaid` blocks are left for `page.html` to draw as diagrams, and other
-/// code blocks are rendered as plain text.
+/// Renders markdown to HTML. Headings get an `id` and a `#` link to themselves. Fenced code blocks
+/// whose info string names a supported language are syntax highlighted, `mermaid` blocks are left
+/// for `page.html` to draw as diagrams, and other code blocks are rendered as plain text.
 fn render_markdown(markdown: &str) -> String {
     let mut parser = Parser::new_ext(markdown, Options::all());
     let mut events = Vec::new();
+    let mut ids = HashSet::new();
     while let Some(event) = parser.next() {
+        if let Event::Start(Tag::Heading {
+            level,
+            id,
+            classes,
+            attrs,
+        }) = event
+        {
+            // Headings hold only inline content, so the next heading end tag closes this one.
+            let content: Vec<_> = parser
+                .by_ref()
+                .take_while(|event| !matches!(event, Event::End(TagEnd::Heading(_))))
+                .collect();
+            // An explicit `{#id}` is kept as written; otherwise the id is derived from the text.
+            let id = match id {
+                Some(id) => {
+                    ids.insert(id.to_string());
+                    id.to_string()
+                }
+                None => unique_id(&mut ids, slugify(&content)),
+            };
+            let anchor = format!(
+                "<a class=\"anchor\" href=\"#{}\" aria-label=\"Link to this section\">#</a>",
+                escape_html(&id)
+            );
+            events.push(Event::Start(Tag::Heading {
+                level,
+                id: Some(id.into()),
+                classes,
+                attrs,
+            }));
+            events.extend(content);
+            events.push(Event::InlineHtml(anchor.into()));
+            events.push(Event::End(TagEnd::Heading(level)));
+            continue;
+        }
+
         let Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) = &event else {
             events.push(event);
             continue;
@@ -294,6 +332,41 @@ fn render_markdown(markdown: &str) -> String {
     let mut body = String::new();
     html::push_html(&mut body, events.into_iter());
     body
+}
+
+/// Derives a heading id from its text the way GitHub does: lowercased, with ASCII punctuation other
+/// than `-` and `_` removed and each space replaced by `-`.
+fn slugify(content: &[Event]) -> String {
+    let mut slug = String::new();
+    for event in content {
+        let (Event::Text(text) | Event::Code(text)) = event else {
+            continue;
+        };
+        for c in text.chars() {
+            if c == ' ' {
+                slug.push('-');
+            } else if c == '-' || c == '_' || !(c.is_ascii_punctuation() || c.is_whitespace()) {
+                slug.extend(c.to_lowercase());
+            }
+        }
+    }
+    slug
+}
+
+/// Returns `slug`, or `slug-1`, `slug-2`, ... when it is already taken, and marks it as taken.
+fn unique_id(ids: &mut HashSet<String>, slug: String) -> String {
+    let base = if slug.is_empty() {
+        "section".to_string()
+    } else {
+        slug
+    };
+    let mut id = base.clone();
+    let mut n = 0;
+    while !ids.insert(id.clone()) {
+        n += 1;
+        id = format!("{base}-{n}");
+    }
+    id
 }
 
 /// Fills the `{{title}}`, `{{etag}}`, `{{sidebar}}` and `{{body}}` placeholders of `page.html` in
@@ -398,6 +471,26 @@ mod tests {
         assert_eq!(
             html,
             "<pre class=\"mermaid\">graph TD\n  A --&gt; B&lt;br&gt;\n</pre>\n"
+        );
+    }
+
+    #[test]
+    fn links_headings_to_themselves() {
+        let html = render_markdown(
+            "# Hello, `World`!\n## Hello World\n## Custom {#custom}\n### สวัสดี ครับ\n## ?\n",
+        );
+        assert_eq!(
+            html,
+            "<h1 id=\"hello-world\">Hello, <code>World</code>!\
+             <a class=\"anchor\" href=\"#hello-world\" aria-label=\"Link to this section\">#</a></h1>\n\
+             <h2 id=\"hello-world-1\">Hello World\
+             <a class=\"anchor\" href=\"#hello-world-1\" aria-label=\"Link to this section\">#</a></h2>\n\
+             <h2 id=\"custom\">Custom\
+             <a class=\"anchor\" href=\"#custom\" aria-label=\"Link to this section\">#</a></h2>\n\
+             <h3 id=\"สวัสดี-ครับ\">สวัสดี ครับ\
+             <a class=\"anchor\" href=\"#สวัสดี-ครับ\" aria-label=\"Link to this section\">#</a></h3>\n\
+             <h2 id=\"section\">?\
+             <a class=\"anchor\" href=\"#section\" aria-label=\"Link to this section\">#</a></h2>\n"
         );
     }
 
