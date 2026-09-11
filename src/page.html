@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="mdreader-etag" content="{{etag}}" />
     <title>{{title}}</title>
     <script>
       // Apply the saved theme before the page renders to avoid a flash of the wrong theme.
@@ -318,23 +319,33 @@
       });
       labelThemeToggle();
 
-      // Mermaid is only loaded on pages with diagrams, and they are drawn again whenever the
-      // effective theme changes. Until then, or if mermaid fails to load, the source is shown.
-      const diagrams = [...document.querySelectorAll("pre.mermaid")];
-      const diagramSources = diagrams.map((diagram) => diagram.textContent);
+      // Mermaid is only loaded once a page has diagrams, and they are drawn again whenever the
+      // effective theme or the page changes. Until then, or if mermaid fails to load, the source
+      // is shown.
+      const diagramSources = new WeakMap();
+      const trackDiagrams = (root) => {
+        for (const diagram of root.querySelectorAll("pre.mermaid")) {
+          diagramSources.set(diagram, diagram.textContent);
+        }
+      };
+      trackDiagrams(document);
       const darkScheme = matchMedia("(prefers-color-scheme: dark)");
-      const loadMermaid =
-        diagrams.length > 0 &&
-        import("https://cdn.jsdelivr.net/npm/mermaid@12.0.0/dist/mermaid.esm.min.mjs").then(
+      let mermaidModule;
+      const loadMermaid = () =>
+        (mermaidModule ??= import(
+          "https://cdn.jsdelivr.net/npm/mermaid@12.0.0/dist/mermaid.esm.min.mjs"
+        ).then(
           ({ default: mermaid }) => mermaid,
           (err) => console.error("mdreader: cannot load mermaid", err),
-        );
+        ));
       let diagramRenders = 0;
       const renderDiagrams = async () => {
-        const mermaid = await loadMermaid;
-        if (!mermaid) return;
-        // A newer render, started by another theme change, supersedes this one.
+        // A newer render, started by a theme change or a page update, supersedes this one.
         const render = ++diagramRenders;
+        const diagrams = [...document.querySelectorAll("pre.mermaid")];
+        if (diagrams.length === 0) return;
+        const mermaid = await loadMermaid();
+        if (!mermaid || render !== diagramRenders) return;
         const theme = currentTheme();
         const dark = theme === "dark" || (theme === "system" && darkScheme.matches);
         mermaid.initialize({
@@ -351,7 +362,7 @@
           try {
             const { svg, bindFunctions } = await mermaid.render(
               `mermaid-${render}-${i}`,
-              diagramSources[i],
+              diagramSources.get(diagram),
               scratch,
             );
             if (render !== diagramRenders) return;
@@ -360,7 +371,7 @@
             bindFunctions?.(diagram);
           } catch (err) {
             if (render !== diagramRenders) return;
-            diagram.textContent = diagramSources[i];
+            diagram.textContent = diagramSources.get(diagram);
             diagram.classList.remove("rendered");
             console.error("mdreader: cannot render mermaid diagram", err);
           } finally {
@@ -372,6 +383,63 @@
         if (currentTheme() === "system") renderDiagrams();
       });
       renderDiagrams();
+
+      // Replaces the content and file tree with those of a newer version of the page, keeping the
+      // scroll position and the sidebar state.
+      const updatePage = (page) => {
+        document.title = page.title;
+        const tree = document.querySelector(".sidebar-tree");
+        const newTree = page.querySelector(".sidebar-tree");
+        if (tree && newTree) tree.replaceChildren(...newTree.childNodes);
+
+        // Unchanged diagrams keep their drawing until they are drawn again, instead of flashing
+        // back to their source.
+        const main = document.querySelector("main");
+        const newMain = page.querySelector("main");
+        const drawings = new Map();
+        for (const diagram of main.querySelectorAll("pre.mermaid.rendered")) {
+          drawings.set(diagramSources.get(diagram), diagram.innerHTML);
+        }
+        trackDiagrams(newMain);
+        for (const diagram of newMain.querySelectorAll("pre.mermaid")) {
+          const drawing = drawings.get(diagramSources.get(diagram));
+          if (drawing === undefined) continue;
+          diagram.innerHTML = drawing;
+          diagram.classList.add("rendered");
+        }
+        main.replaceChildren(...newMain.childNodes);
+        renderDiagrams();
+      };
+
+      // While the page is visible, ask the server every second whether it changed. The server
+      // answers 304 Not Modified until the markdown, or the file tree, is edited.
+      let etag = document.querySelector('meta[name="mdreader-etag"]').content;
+      let refreshTimer;
+      let refreshing = false;
+      const refresh = async () => {
+        clearTimeout(refreshTimer);
+        // A hidden page stops polling until it becomes visible again.
+        if (refreshing || document.hidden) return;
+        refreshing = true;
+        try {
+          const response = await fetch(location.href, {
+            cache: "no-store",
+            headers: { "If-None-Match": etag },
+          });
+          if (response.ok) {
+            const html = await response.text();
+            etag = response.headers.get("ETag") ?? etag;
+            updatePage(new DOMParser().parseFromString(html, "text/html"));
+          }
+        } catch {
+          // The server may be restarting; try again on the next poll.
+        } finally {
+          refreshing = false;
+        }
+        refreshTimer = setTimeout(refresh, 1000);
+      };
+      document.addEventListener("visibilitychange", refresh);
+      refreshTimer = setTimeout(refresh, 1000);
     </script>
   </body>
 </html>

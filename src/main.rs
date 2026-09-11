@@ -1,13 +1,15 @@
 use std::{
     env,
     fmt::Write as _,
-    fs, io,
+    fs,
+    hash::{DefaultHasher, Hash, Hasher},
+    io,
     path::{Path, PathBuf},
     process,
 };
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd, html};
-use tiny_http::{Header, Response, Server};
+use tiny_http::{Header, Request, Response, Server};
 
 mod highlight;
 
@@ -36,9 +38,9 @@ fn main() {
 
     for request in server.incoming_requests() {
         let response = if is_dir {
-            serve_dir(&path, request.url())
+            serve_dir(&path, &request)
         } else {
-            serve_file(&path, request.url())
+            serve_file(&path, &request)
         };
         if let Err(err) = request.respond(response) {
             eprintln!("mdreader: failed to respond: {err}");
@@ -46,39 +48,40 @@ fn main() {
     }
 }
 
-fn serve_file(path: &Path, url: &str) -> Response<io::Cursor<Vec<u8>>> {
-    match url_path(url) {
+fn serve_file(path: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
+    match url_path(request.url()) {
         "/" => match fs::read_to_string(path) {
-            Ok(markdown) => html_response(
-                render_page(&display_name(path), &render_markdown(&markdown), None),
-                200,
-            ),
+            Ok(markdown) => page_response(request, etag(&markdown), |etag| {
+                render_page(&display_name(path), &render_markdown(&markdown), None, etag)
+            }),
             Err(err) => text_response(format!("cannot read {}: {err}", path.display()), 500),
         },
         _ => text_response("not found".to_string(), 404),
     }
 }
 
-fn serve_dir(root: &Path, url: &str) -> Response<io::Cursor<Vec<u8>>> {
+fn serve_dir(root: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
     let tree = match read_tree(root, "") {
         Ok(tree) => tree,
         Err(err) => return text_response(format!("cannot read {}: {err}", root.display()), 500),
     };
     let title = display_name(root);
 
-    let Some(current) = percent_decode(url_path(url)) else {
+    let Some(current) = percent_decode(url_path(request.url())) else {
         return text_response("not found".to_string(), 404);
     };
     let current = current.strip_prefix('/').unwrap_or(&current);
 
     if current.is_empty() {
-        let body = if tree.is_empty() {
-            "<p>No markdown files found.</p>\n"
-        } else {
-            "<p>Select a file from the sidebar.</p>\n"
-        };
-        let sidebar = render_sidebar(&title, &tree, None);
-        return html_response(render_page(&title, body, Some(&sidebar)), 200);
+        return page_response(request, etag(&tree), |etag| {
+            let body = if tree.is_empty() {
+                "<p>No markdown files found.</p>\n"
+            } else {
+                "<p>Select a file from the sidebar.</p>\n"
+            };
+            let sidebar = render_sidebar(&title, &tree, None);
+            render_page(&title, body, Some(&sidebar), etag)
+        });
     }
 
     // Only serve files discovered by the walk, so the URL can never escape the root.
@@ -88,21 +91,55 @@ fn serve_dir(root: &Path, url: &str) -> Response<io::Cursor<Vec<u8>>> {
 
     let file = root.join(current);
     match fs::read_to_string(&file) {
-        Ok(markdown) => {
+        Ok(markdown) => page_response(request, etag((&tree, &markdown)), |etag| {
             let sidebar = render_sidebar(&title, &tree, Some(current));
-            html_response(
-                render_page(
-                    &display_name(&file),
-                    &render_markdown(&markdown),
-                    Some(&sidebar),
-                ),
-                200,
+            render_page(
+                &display_name(&file),
+                &render_markdown(&markdown),
+                Some(&sidebar),
+                etag,
             )
-        }
+        }),
         Err(err) => text_response(format!("cannot read {}: {err}", file.display()), 500),
     }
 }
 
+/// Responds with the page built by `render`, which embeds `etag` so the browser can poll for
+/// changes. A request that already has this version gets 304 Not Modified without rendering.
+fn page_response(
+    request: &Request,
+    etag: String,
+    render: impl FnOnce(&str) -> String,
+) -> Response<io::Cursor<Vec<u8>>> {
+    let unchanged = request
+        .headers()
+        .iter()
+        .filter(|header| header.field.equiv("If-None-Match"))
+        .any(|header| etag_matches(header.value.as_str(), &etag));
+    let response = if unchanged {
+        Response::from_data(Vec::new()).with_status_code(304)
+    } else {
+        html_response(render(&etag), 200)
+    };
+    response.with_header(Header::from_bytes("ETag", etag).expect("valid header"))
+}
+
+/// Identifies a page version by hashing everything it is rendered from.
+fn etag(source: impl Hash) -> String {
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    format!("\"{:016x}\"", hasher.finish())
+}
+
+/// Checks an `If-None-Match` header value, a comma-separated list of entity tags or `*`.
+fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    if_none_match.split(',').any(|tag| {
+        let tag = tag.trim();
+        tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag
+    })
+}
+
+#[derive(Hash)]
 enum Node {
     Dir { name: String, children: Vec<Node> },
     File { name: String, path: String },
@@ -259,9 +296,9 @@ fn render_markdown(markdown: &str) -> String {
     body
 }
 
-/// Fills the `{{title}}`, `{{sidebar}}` and `{{body}}` placeholders of `page.html` in a single
-/// pass, so placeholder-like text inside the substituted values is left untouched.
-fn render_page(title: &str, body: &str, sidebar: Option<&str>) -> String {
+/// Fills the `{{title}}`, `{{etag}}`, `{{sidebar}}` and `{{body}}` placeholders of `page.html` in
+/// a single pass, so placeholder-like text inside the substituted values is left untouched.
+fn render_page(title: &str, body: &str, sidebar: Option<&str>, etag: &str) -> String {
     let title = escape_html(title);
     let mut out = String::with_capacity(PAGE_TEMPLATE.len() + body.len());
     let mut rest = PAGE_TEMPLATE;
@@ -273,6 +310,7 @@ fn render_page(title: &str, body: &str, sidebar: Option<&str>) -> String {
             .expect("unterminated placeholder in page.html");
         match &after[..end] {
             "title" => out.push_str(&title),
+            "etag" => out.push_str(&escape_html(etag)),
             "sidebar" => out.push_str(sidebar.unwrap_or_default()),
             "body" => out.push_str(body),
             name => panic!("unknown placeholder `{name}` in page.html"),
@@ -361,5 +399,16 @@ mod tests {
             html,
             "<pre class=\"mermaid\">graph TD\n  A --&gt; B&lt;br&gt;\n</pre>\n"
         );
+    }
+
+    #[test]
+    fn matches_if_none_match_etags() {
+        let etag = "\"00ff\"";
+        assert!(etag_matches("\"00ff\"", etag));
+        assert!(etag_matches("W/\"00ff\"", etag));
+        assert!(etag_matches("\"abcd\", \"00ff\"", etag));
+        assert!(etag_matches("*", etag));
+        assert!(!etag_matches("\"abcd\"", etag));
+        assert!(!etag_matches("00ff", etag));
     }
 }
