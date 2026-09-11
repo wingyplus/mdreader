@@ -207,7 +207,8 @@ fn push_tree(out: &mut String, nodes: &[Node], current: Option<&str>) {
 }
 
 /// Renders markdown to HTML. Fenced code blocks whose info string names a supported language are
-/// syntax highlighted; other code blocks are rendered as plain text.
+/// syntax highlighted, `mermaid` blocks are left for `page.html` to draw as diagrams, and other
+/// code blocks are rendered as plain text.
 fn render_markdown(markdown: &str) -> String {
     let mut parser = Parser::new_ext(markdown, Options::all());
     let mut events = Vec::new();
@@ -228,6 +229,13 @@ fn render_markdown(markdown: &str) -> String {
                 Event::Text(text) => code.push_str(&text),
                 _ => break,
             }
+        }
+
+        // The diagram source stays readable as text until the browser renders it.
+        if lang.eq_ignore_ascii_case("mermaid") {
+            let html = format!("<pre class=\"mermaid\">{}</pre>\n", escape_html(&code));
+            events.push(Event::Html(html.into()));
+            continue;
         }
 
         match highlight::highlight(lang, &code) {
@@ -340,4 +348,18 @@ fn with_content_type(
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     let header = Header::from_bytes("Content-Type", content_type).expect("valid header");
     response.with_header(header)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_mermaid_blocks_for_the_browser() {
+        let html = render_markdown("```Mermaid\ngraph TD\n  A --> B<br>\n```\n");
+        assert_eq!(
+            html,
+            "<pre class=\"mermaid\">graph TD\n  A --&gt; B&lt;br&gt;\n</pre>\n"
+        );
+    }
 }

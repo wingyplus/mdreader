@@ -61,6 +61,14 @@
       code {
         font-family: ui-monospace, monospace;
       }
+      /* A rendered diagram drops the code block styling around its SVG. */
+      pre.mermaid.rendered {
+        padding: 0;
+        background: none;
+        text-align: center;
+        white-space: normal;
+        font-family: inherit;
+      }
       .hl-comment {
         color: light-dark(#6e7781, #9198a1);
         font-style: italic;
@@ -306,8 +314,64 @@
           }
         } catch {}
         labelThemeToggle();
+        renderDiagrams();
       });
       labelThemeToggle();
+
+      // Mermaid is only loaded on pages with diagrams, and they are drawn again whenever the
+      // effective theme changes. Until then, or if mermaid fails to load, the source is shown.
+      const diagrams = [...document.querySelectorAll("pre.mermaid")];
+      const diagramSources = diagrams.map((diagram) => diagram.textContent);
+      const darkScheme = matchMedia("(prefers-color-scheme: dark)");
+      const loadMermaid =
+        diagrams.length > 0 &&
+        import("https://cdn.jsdelivr.net/npm/mermaid@12.0.0/dist/mermaid.esm.min.mjs").then(
+          ({ default: mermaid }) => mermaid,
+          (err) => console.error("mdreader: cannot load mermaid", err),
+        );
+      let diagramRenders = 0;
+      const renderDiagrams = async () => {
+        const mermaid = await loadMermaid;
+        if (!mermaid) return;
+        // A newer render, started by another theme change, supersedes this one.
+        const render = ++diagramRenders;
+        const theme = currentTheme();
+        const dark = theme === "dark" || (theme === "system" && darkScheme.matches);
+        mermaid.initialize({
+          startOnLoad: false,
+          theme: dark ? "dark" : "default",
+          suppressErrorRendering: true,
+        });
+        for (const [i, diagram] of diagrams.entries()) {
+          // Some diagrams, such as Gantt charts, size themselves to the element they are drawn
+          // in, so draw each one out of sight at the width it will occupy.
+          const scratch = document.createElement("div");
+          scratch.style.cssText = `position: absolute; visibility: hidden; overflow: hidden; height: 0; width: ${diagram.offsetWidth}px`;
+          diagram.before(scratch);
+          try {
+            const { svg, bindFunctions } = await mermaid.render(
+              `mermaid-${render}-${i}`,
+              diagramSources[i],
+              scratch,
+            );
+            if (render !== diagramRenders) return;
+            diagram.innerHTML = svg;
+            diagram.classList.add("rendered");
+            bindFunctions?.(diagram);
+          } catch (err) {
+            if (render !== diagramRenders) return;
+            diagram.textContent = diagramSources[i];
+            diagram.classList.remove("rendered");
+            console.error("mdreader: cannot render mermaid diagram", err);
+          } finally {
+            scratch.remove();
+          }
+        }
+      };
+      darkScheme.addEventListener("change", () => {
+        if (currentTheme() === "system") renderDiagrams();
+      });
+      renderDiagrams();
     </script>
   </body>
 </html>
