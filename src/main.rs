@@ -6,8 +6,10 @@ use std::{
     process,
 };
 
-use pulldown_cmark::{Options, Parser, html};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd, html};
 use tiny_http::{Header, Response, Server};
+
+mod highlight;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 const PAGE_TEMPLATE: &str = include_str!("page.html");
@@ -196,10 +198,48 @@ fn push_tree(out: &mut String, nodes: &[Node], current: Option<&str>) {
     out.push_str("</ul>\n");
 }
 
+/// Renders markdown to HTML. Fenced code blocks whose info string names a supported language are
+/// syntax highlighted; other code blocks are rendered as plain text.
 fn render_markdown(markdown: &str) -> String {
-    let parser = Parser::new_ext(markdown, Options::all());
+    let mut parser = Parser::new_ext(markdown, Options::all());
+    let mut events = Vec::new();
+    while let Some(event) = parser.next() {
+        let Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) = &event else {
+            events.push(event);
+            continue;
+        };
+        let Some(lang) = info.split_whitespace().next() else {
+            events.push(event);
+            continue;
+        };
+
+        // A code block contains only text events up to its end tag.
+        let mut code = String::new();
+        for event in parser.by_ref() {
+            match event {
+                Event::Text(text) => code.push_str(&text),
+                _ => break,
+            }
+        }
+
+        match highlight::highlight(lang, &code) {
+            Some(highlighted) => {
+                let html = format!(
+                    "<pre><code class=\"language-{}\">{highlighted}</code></pre>\n",
+                    escape_html(lang)
+                );
+                events.push(Event::Html(html.into()));
+            }
+            None => events.extend([
+                event,
+                Event::Text(code.into()),
+                Event::End(TagEnd::CodeBlock),
+            ]),
+        }
+    }
+
     let mut body = String::new();
-    html::push_html(&mut body, parser);
+    html::push_html(&mut body, events.into_iter());
     body
 }
 
