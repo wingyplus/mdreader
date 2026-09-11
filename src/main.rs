@@ -10,7 +10,7 @@ use std::{
 };
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd, html};
-use tiny_http::{Header, Request, Response, Server};
+use tiny_http::{Header, Method, Request, Response, Server};
 
 mod highlight;
 
@@ -50,15 +50,20 @@ fn main() {
 }
 
 fn serve_file(path: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
-    match url_path(request.url()) {
-        "/" => match fs::read_to_string(path) {
-            Ok(markdown) => page_response(request, etag(&markdown), |etag| {
-                render_page(&display_name(path), &render_markdown(&markdown), None, etag)
-            }),
-            Err(err) => text_response(format!("cannot read {}: {err}", path.display()), 500),
-        },
-        _ => text_response("not found".to_string(), 404),
+    if url_path(request.url()) != "/" {
+        return text_response("not found".to_string(), 404);
     }
+    let markdown = match fs::read_to_string(path) {
+        Ok(markdown) => markdown,
+        Err(err) => return text_response(format!("cannot read {}: {err}", path.display()), 500),
+    };
+    let etag_of = |markdown: &str| etag(markdown);
+    if *request.method() == Method::Post {
+        return toggle_task_response(path, request, &markdown, etag_of);
+    }
+    page_response(request, etag_of(&markdown), |etag| {
+        render_page(&display_name(path), &render_markdown(&markdown), None, etag)
+    })
 }
 
 fn serve_dir(root: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
@@ -91,18 +96,23 @@ fn serve_dir(root: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
     }
 
     let file = root.join(current);
-    match fs::read_to_string(&file) {
-        Ok(markdown) => page_response(request, etag((&tree, &markdown)), |etag| {
-            let sidebar = render_sidebar(&title, &tree, Some(current));
-            render_page(
-                &display_name(&file),
-                &render_markdown(&markdown),
-                Some(&sidebar),
-                etag,
-            )
-        }),
-        Err(err) => text_response(format!("cannot read {}: {err}", file.display()), 500),
+    let markdown = match fs::read_to_string(&file) {
+        Ok(markdown) => markdown,
+        Err(err) => return text_response(format!("cannot read {}: {err}", file.display()), 500),
+    };
+    let etag_of = |markdown: &str| etag((&tree, markdown));
+    if *request.method() == Method::Post {
+        return toggle_task_response(&file, request, &markdown, etag_of);
     }
+    page_response(request, etag_of(&markdown), |etag| {
+        let sidebar = render_sidebar(&title, &tree, Some(current));
+        render_page(
+            &display_name(&file),
+            &render_markdown(&markdown),
+            Some(&sidebar),
+            etag,
+        )
+    })
 }
 
 /// Responds with the page built by `render`, which embeds `etag` so the browser can poll for
@@ -138,6 +148,55 @@ fn etag_matches(if_none_match: &str, etag: &str) -> bool {
         let tag = tag.trim();
         tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag
     })
+}
+
+/// Checks or unchecks a task list item of the markdown file at `path`, as asked by a `POST` with
+/// `?task=<index>&checked=<true|false>` from the page. `etag_of` gives the page's entity tag for a
+/// version of the markdown. The request must name the page it was made on in `If-Match`, so a page
+/// that is out of date cannot overwrite newer edits. Browsers only let another website send that
+/// header after a CORS preflight, which this server never allows, so no other website can do this.
+fn toggle_task_response(
+    path: &Path,
+    request: &Request,
+    markdown: &str,
+    etag_of: impl Fn(&str) -> String,
+) -> Response<io::Cursor<Vec<u8>>> {
+    let url = request.url();
+    let index = query_param(url, "task").and_then(|index| index.parse().ok());
+    let checked = match query_param(url, "checked") {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    };
+    let (Some(index), Some(checked)) = (index, checked) else {
+        return text_response(
+            "expected ?task=<index>&checked=<true|false>".to_string(),
+            400,
+        );
+    };
+
+    let Some(if_match) = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("If-Match"))
+    else {
+        return text_response("missing If-Match header".to_string(), 428);
+    };
+    if if_match.value.as_str().trim() != etag_of(markdown) {
+        return text_response("the page is out of date".to_string(), 412);
+    }
+
+    let Some(updated) = toggle_task(markdown, index, checked) else {
+        return text_response(format!("no task {index}"), 400);
+    };
+    if updated != markdown
+        && let Err(err) = fs::write(path, &updated)
+    {
+        return text_response(format!("cannot write {}: {err}", path.display()), 500);
+    }
+    Response::from_data(Vec::new())
+        .with_status_code(204)
+        .with_header(Header::from_bytes("ETag", etag_of(&updated)).expect("valid header"))
 }
 
 #[derive(Hash)]
@@ -246,11 +305,13 @@ fn push_tree(out: &mut String, nodes: &[Node], current: Option<&str>) {
 
 /// Renders markdown to HTML. Headings get an `id` and a `#` link to themselves. Fenced code blocks
 /// whose info string names a supported language are syntax highlighted, `mermaid` blocks are left
-/// for `page.html` to draw as diagrams, and other code blocks are rendered as plain text.
+/// for `page.html` to draw as diagrams, and other code blocks are rendered as plain text. Task list
+/// checkboxes are numbered in document order, the way `toggle_task` counts them.
 fn render_markdown(markdown: &str) -> String {
     let mut parser = Parser::new_ext(markdown, Options::all());
     let mut events = Vec::new();
     let mut ids = HashSet::new();
+    let mut tasks = 0;
     while let Some(event) = parser.next() {
         if let Event::Start(Tag::Heading {
             level,
@@ -285,6 +346,17 @@ fn render_markdown(markdown: &str) -> String {
             events.extend(content);
             events.push(Event::InlineHtml(anchor.into()));
             events.push(Event::End(TagEnd::Heading(level)));
+            continue;
+        }
+
+        // The checkbox stays disabled until `page.html` can save it.
+        if let Event::TaskListMarker(checked) = event {
+            let checked = if checked { " checked=\"\"" } else { "" };
+            let html = format!(
+                "<input type=\"checkbox\" data-task=\"{tasks}\" disabled=\"\"{checked}/>\n"
+            );
+            events.push(Event::InlineHtml(html.into()));
+            tasks += 1;
             continue;
         }
 
@@ -332,6 +404,27 @@ fn render_markdown(markdown: &str) -> String {
     let mut body = String::new();
     html::push_html(&mut body, events.into_iter());
     body
+}
+
+/// Returns `markdown` with its `index`th task list item checked or unchecked, counting items in
+/// document order, or `None` if there is no such item. Only the character between the brackets
+/// changes, and an item already in the wanted state is left as written.
+fn toggle_task(markdown: &str, index: usize, checked: bool) -> Option<String> {
+    let (was_checked, range) = Parser::new_ext(markdown, Options::all())
+        .into_offset_iter()
+        .filter_map(|(event, range)| match event {
+            Event::TaskListMarker(checked) => Some((checked, range)),
+            _ => None,
+        })
+        .nth(index)?;
+    let mut updated = markdown.to_string();
+    if was_checked != checked {
+        // The marker's range can include the whitespace before its `[`.
+        let start = range.start;
+        let mark = start + markdown[range].find('[')? + 1;
+        updated.replace_range(mark..mark + 1, if checked { "x" } else { " " });
+    }
+    Some(updated)
 }
 
 /// Derives a heading id from its text the way GitHub does: lowercased, with ASCII punctuation other
@@ -402,6 +495,15 @@ fn display_name(path: &Path) -> String {
 
 fn url_path(url: &str) -> &str {
     url.split(['?', '#']).next().unwrap_or_default()
+}
+
+/// Returns the undecoded value of the first `name` parameter in the query string of `url`.
+fn query_param<'a>(url: &'a str, name: &str) -> Option<&'a str> {
+    let (_, query) = url.split_once('?')?;
+    let query = query.split('#').next().unwrap_or_default();
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
 }
 
 fn percent_decode(s: &str) -> Option<String> {
@@ -492,6 +594,46 @@ mod tests {
              <h2 id=\"section\">?\
              <a class=\"anchor\" href=\"#section\" aria-label=\"Link to this section\">#</a></h2>\n"
         );
+    }
+
+    #[test]
+    fn numbers_task_list_checkboxes() {
+        let html = render_markdown("- [ ] one\n- [x] two\n");
+        assert_eq!(
+            html,
+            "<ul>\n\
+             <li><input type=\"checkbox\" data-task=\"0\" disabled=\"\"/>\none</li>\n\
+             <li><input type=\"checkbox\" data-task=\"1\" disabled=\"\" checked=\"\"/>\ntwo</li>\n\
+             </ul>\n"
+        );
+    }
+
+    #[test]
+    fn toggles_task_list_items() {
+        let markdown = "- [ ] one\n  - [X] two\n\n  text\n\n1. [x] three\n";
+        assert_eq!(
+            toggle_task(markdown, 0, true).as_deref(),
+            Some("- [x] one\n  - [X] two\n\n  text\n\n1. [x] three\n")
+        );
+        assert_eq!(
+            toggle_task(markdown, 1, false).as_deref(),
+            Some("- [ ] one\n  - [ ] two\n\n  text\n\n1. [x] three\n")
+        );
+        assert_eq!(toggle_task(markdown, 1, true).as_deref(), Some(markdown));
+        assert_eq!(
+            toggle_task(markdown, 2, false).as_deref(),
+            Some("- [ ] one\n  - [X] two\n\n  text\n\n1. [ ] three\n")
+        );
+        assert_eq!(toggle_task(markdown, 3, true), None);
+    }
+
+    #[test]
+    fn reads_query_params() {
+        let url = "/a.md?task=3&checked=true#top";
+        assert_eq!(query_param(url, "task"), Some("3"));
+        assert_eq!(query_param(url, "checked"), Some("true"));
+        assert_eq!(query_param(url, "check"), None);
+        assert_eq!(query_param("/a.md", "task"), None);
     }
 
     #[test]

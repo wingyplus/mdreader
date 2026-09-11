@@ -129,17 +129,22 @@
       }
       /* A task list item shows its checkbox in place of the bullet. In a loose list the checkbox
          sits in the item's first paragraph. */
-      ul > li:has(> input[type="checkbox"]:first-child),
-      ul > li:has(> p:first-child > input[type="checkbox"]:first-child) {
+      input[data-task] {
+        accent-color: var(--accent);
+      }
+      input[data-task]:enabled {
+        cursor: pointer;
+      }
+      ul > li:has(> input[data-task]),
+      ul > li:has(> p:first-child > input[data-task]) {
         list-style: none;
       }
-      ul > li > input[type="checkbox"]:first-child,
-      ul > li > p:first-child > input[type="checkbox"]:first-child {
+      ul > li > input[data-task],
+      ul > li > p:first-child > input[data-task] {
         width: 1em;
         height: 1em;
         margin: 0 0.15em 0 -1.4em;
         vertical-align: -0.125em;
-        accent-color: var(--accent);
       }
       /* The link to a heading shows while hovering the heading, or always without a hover. */
       .anchor {
@@ -439,6 +444,7 @@
           drawings.set(diagramSources.get(diagram), diagram.innerHTML);
         }
         trackDiagrams(newMain);
+        enableTasks(newMain);
         for (const diagram of newMain.querySelectorAll("pre.mermaid")) {
           const drawing = drawings.get(diagramSources.get(diagram));
           if (drawing === undefined) continue;
@@ -478,6 +484,38 @@
       };
       document.addEventListener("visibilitychange", refresh);
       refreshTimer = setTimeout(refresh, 1000);
+
+      // Checking or unchecking a task list item saves it to the markdown file. Changes are sent one
+      // at a time, each with the version of the page it was made on, and the server refuses one
+      // made on a page that is out of date.
+      const enableTasks = (root) => {
+        for (const task of root.querySelectorAll("input[data-task]")) task.disabled = false;
+      };
+      enableTasks(document);
+      let taskUpdates = Promise.resolve();
+      document.querySelector("main").addEventListener("change", ({ target }) => {
+        if (!target.matches("input[data-task]")) return;
+        const checked = target.checked;
+        const url = new URL(location.href);
+        url.hash = "";
+        url.search = new URLSearchParams({ task: target.dataset.task, checked });
+        taskUpdates = taskUpdates.then(async () => {
+          try {
+            const response = await fetch(url, { method: "POST", headers: { "If-Match": etag } });
+            if (response.ok) {
+              // The page already shows the change, so it is the version the server now has.
+              etag = response.headers.get("ETag") ?? etag;
+              return;
+            }
+            console.error("mdreader: cannot save task", response.status, await response.text());
+          } catch (err) {
+            console.error("mdreader: cannot save task", err);
+          }
+          // Undo the change on the page, and show the file as it is now.
+          target.checked = !checked;
+          refresh();
+        });
+      });
     </script>
   </body>
 </html>

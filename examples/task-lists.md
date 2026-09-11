@@ -1,7 +1,8 @@
 # Task lists
 
-List items starting with `[ ]` or `[x]` show a checkbox in place of the bullet. Run
-`mdreader examples` and open this file to see them rendered.
+List items starting with `[ ]` or `[x]` show a checkbox in place of the bullet. Checking or
+unchecking one saves the change to this file. Run `mdreader examples` and open this file to try
+it.
 
 ## Checked and unchecked
 
