@@ -162,12 +162,20 @@ fn contains_file(nodes: &[Node], path: &str) -> bool {
 }
 
 fn render_sidebar(title: &str, tree: &[Node], current: Option<&str>) -> String {
+    // The hamburger button only shows on narrow screens, where the tree starts collapsed.
     let mut out = format!(
-        "<nav class=\"sidebar\">\n<a class=\"root\" href=\"/\">{}</a>\n",
+        "<nav class=\"sidebar\">\n<div class=\"sidebar-header\">\n\
+         <button class=\"menu-toggle\" type=\"button\" aria-label=\"Toggle file list\" \
+         aria-controls=\"sidebar-tree\" aria-expanded=\"false\">\
+         <svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" aria-hidden=\"true\">\
+         <path d=\"M3 5h14M3 10h14M3 15h14\" stroke=\"currentColor\" stroke-width=\"2\" \
+         stroke-linecap=\"round\"/></svg></button>\n\
+         <a class=\"root\" href=\"/\">{}</a>\n\
+         </div>\n<div id=\"sidebar-tree\" class=\"sidebar-tree\">\n",
         escape_html(title)
     );
     push_tree(&mut out, tree, current);
-    out.push_str("</nav>\n");
+    out.push_str("</div>\n</nav>\n");
     out
 }
 
