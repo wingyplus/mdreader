@@ -13,6 +13,18 @@
           document.documentElement.dataset.theme = theme;
         }
       } catch {}
+
+      // Renderers draw the elements of the page that the browser cannot draw on its own, such as
+      // mermaid diagrams. They are collected here, before the page is parsed, so that a script in
+      // the page can register one as well as the custom script can. The page's own script below
+      // runs them, and sets `run` so that later registrations are run right away.
+      window.mdreader = {
+        renderers: [],
+        onRender(renderer) {
+          this.renderers.push(renderer);
+          this.run?.(renderer);
+        },
+      };
     </script>
     <style>
       /* Colors follow the system theme unless `data-theme` pins one; `light-dark()` picks from the
@@ -62,8 +74,8 @@
       code {
         font-family: ui-monospace, monospace;
       }
-      /* A rendered diagram drops the code block styling around its SVG. */
-      pre.mermaid.rendered {
+      /* A block a renderer has drawn drops the code block styling around its drawing. */
+      pre.rendered {
         padding: 0;
         background: none;
         text-align: center;
@@ -340,6 +352,13 @@
       const themes = ["system", "light", "dark"];
       const themeToggle = document.querySelector(".theme-toggle");
       const currentTheme = () => document.documentElement.dataset.theme ?? "system";
+      const darkScheme = matchMedia("(prefers-color-scheme: dark)");
+      // The theme the page is actually shown in, which renderers draw to match.
+      const activeTheme = () => {
+        const theme = currentTheme();
+        if (theme !== "system") return theme;
+        return darkScheme.matches ? "dark" : "light";
+      };
       const labelThemeToggle = () => {
         const theme = currentTheme();
         const next = themes[(themes.indexOf(theme) + 1) % themes.length];
@@ -358,21 +377,43 @@
           }
         } catch {}
         labelThemeToggle();
-        renderDiagrams();
+        render();
       });
       labelThemeToggle();
 
-      // Mermaid is only loaded once a page has diagrams, and they are drawn again whenever the
-      // effective theme or the page changes. Until then, or if mermaid fails to load, the source
-      // is shown.
-      const diagramSources = new WeakMap();
-      const trackDiagrams = (root) => {
-        for (const diagram of root.querySelectorAll("pre.mermaid")) {
-          diagramSources.set(diagram, diagram.textContent);
+      // A renderer is called with the page content and `{ theme, signal }` whenever the page is
+      // loaded or updated and whenever the theme changes, and may be async. `signal` is aborted
+      // once a newer run has superseded it, so a slow renderer can stop instead of drawing over
+      // the newer content. Adding the `rendered` class to an element it has drawn keeps the
+      // drawing across page updates.
+      let renderRun;
+      const runRenderer = (renderer) => {
+        const context = { theme: activeTheme(), signal: renderRun.signal };
+        const report = (err) => console.error("mdreader: renderer failed", err);
+        try {
+          Promise.resolve(renderer(document.querySelector("main"), context)).catch(report);
+        } catch (err) {
+          report(err);
         }
       };
-      trackDiagrams(document);
-      const darkScheme = matchMedia("(prefers-color-scheme: dark)");
+      const render = () => {
+        renderRun?.abort();
+        renderRun = new AbortController();
+        for (const renderer of mdreader.renderers) runRenderer(renderer);
+      };
+
+      // The text the server sent for a block, kept so that a renderer can still read it after it
+      // has replaced the block's content, and so that an unchanged block can be recognized in a
+      // newer version of the page.
+      const sources = new WeakMap();
+      const trackSources = (root) => {
+        for (const block of root.querySelectorAll("pre")) sources.set(block, block.textContent);
+      };
+      trackSources(document);
+      mdreader.source = (element) => sources.get(element);
+
+      // Mermaid is only loaded once a page has diagrams. Until then, or if mermaid fails to load,
+      // the source is shown.
       let mermaidModule;
       const loadMermaid = () =>
         (mermaidModule ??= import(
@@ -381,19 +422,16 @@
           ({ default: mermaid }) => mermaid,
           (err) => console.error("mdreader: cannot load mermaid", err),
         ));
-      let diagramRenders = 0;
-      const renderDiagrams = async () => {
-        // A newer render, started by a theme change or a page update, supersedes this one.
-        const render = ++diagramRenders;
-        const diagrams = [...document.querySelectorAll("pre.mermaid")];
+      let diagramRuns = 0;
+      mdreader.onRender(async (main, { theme, signal }) => {
+        const diagrams = [...main.querySelectorAll("pre.mermaid")];
         if (diagrams.length === 0) return;
         const mermaid = await loadMermaid();
-        if (!mermaid || render !== diagramRenders) return;
-        const theme = currentTheme();
-        const dark = theme === "dark" || (theme === "system" && darkScheme.matches);
+        if (!mermaid || signal.aborted) return;
+        const run = ++diagramRuns;
         mermaid.initialize({
           startOnLoad: false,
-          theme: dark ? "dark" : "default",
+          theme: theme === "dark" ? "dark" : "default",
           suppressErrorRendering: true,
         });
         for (const [i, diagram] of diagrams.entries()) {
@@ -404,55 +442,65 @@
           diagram.before(scratch);
           try {
             const { svg, bindFunctions } = await mermaid.render(
-              `mermaid-${render}-${i}`,
-              diagramSources.get(diagram),
+              `mermaid-${run}-${i}`,
+              mdreader.source(diagram),
               scratch,
             );
-            if (render !== diagramRenders) return;
+            if (signal.aborted) return;
             diagram.innerHTML = svg;
             diagram.classList.add("rendered");
             bindFunctions?.(diagram);
           } catch (err) {
-            if (render !== diagramRenders) return;
-            diagram.textContent = diagramSources.get(diagram);
+            if (signal.aborted) return;
+            diagram.textContent = mdreader.source(diagram);
             diagram.classList.remove("rendered");
             console.error("mdreader: cannot render mermaid diagram", err);
           } finally {
             scratch.remove();
           }
         }
-      };
-      darkScheme.addEventListener("change", () => {
-        if (currentTheme() === "system") renderDiagrams();
       });
-      renderDiagrams();
+      darkScheme.addEventListener("change", () => {
+        if (currentTheme() === "system") render();
+      });
+      render();
+      // From here on a renderer registered by the custom script is run as soon as it registers.
+      mdreader.run = runRenderer;
 
       // Replaces the content and file tree with those of a newer version of the page, keeping the
       // scroll position and the sidebar state.
+      const scriptSrc = (page) =>
+        page.querySelector("script[data-mdreader-script]")?.getAttribute("src");
       const updatePage = (page) => {
+        // An edited custom script takes a full load: replacing the content cannot run it again.
+        if (scriptSrc(page) !== scriptSrc(document)) {
+          location.reload();
+          return;
+        }
         document.title = page.title;
         const tree = document.querySelector(".sidebar-tree");
         const newTree = page.querySelector(".sidebar-tree");
         if (tree && newTree) tree.replaceChildren(...newTree.childNodes);
 
-        // Unchanged diagrams keep their drawing until they are drawn again, instead of flashing
+        // Unchanged blocks keep their drawing until they are drawn again, instead of flashing
         // back to their source.
         const main = document.querySelector("main");
         const newMain = page.querySelector("main");
         const drawings = new Map();
-        for (const diagram of main.querySelectorAll("pre.mermaid.rendered")) {
-          drawings.set(diagramSources.get(diagram), diagram.innerHTML);
+        for (const drawn of main.querySelectorAll(".rendered")) {
+          const source = sources.get(drawn);
+          if (source !== undefined) drawings.set(source, drawn.innerHTML);
         }
-        trackDiagrams(newMain);
+        trackSources(newMain);
         enableTasks(newMain);
-        for (const diagram of newMain.querySelectorAll("pre.mermaid")) {
-          const drawing = drawings.get(diagramSources.get(diagram));
+        for (const block of newMain.querySelectorAll("pre")) {
+          const drawing = drawings.get(sources.get(block));
           if (drawing === undefined) continue;
-          diagram.innerHTML = drawing;
-          diagram.classList.add("rendered");
+          block.innerHTML = drawing;
+          block.classList.add("rendered");
         }
         main.replaceChildren(...newMain.childNodes);
-        renderDiagrams();
+        render();
       };
 
       // While the page is visible, ask the server every second whether it changed. The server
@@ -517,5 +565,6 @@
         });
       });
     </script>
+    {{script}}
   </body>
 </html>

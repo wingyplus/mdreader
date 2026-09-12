@@ -16,14 +16,55 @@ mod highlight;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 const PAGE_TEMPLATE: &str = include_str!("page.html");
+const USAGE: &str = "usage: mdreader [--script <file.js>] <file.md|dir> [addr]";
+
+/// Where the custom script named by `--script` is served, out of the way of any markdown file.
+const SCRIPT_URL: &str = "/_mdreader/script.js";
+
+struct Args {
+    path: PathBuf,
+    addr: String,
+    script: Option<PathBuf>,
+}
+
+/// Parses `[--script <file.js>] <file.md|dir> [addr]`, or says why it cannot.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    let mut args = args.into_iter();
+    let mut positional = Vec::new();
+    let mut script = None;
+    while let Some(arg) = args.next() {
+        if arg == "--script" {
+            let Some(value) = args.next() else {
+                return Err("--script needs a file".to_string());
+            };
+            script = Some(PathBuf::from(value));
+        } else if let Some(value) = arg.strip_prefix("--script=") {
+            script = Some(PathBuf::from(value));
+        } else if arg.starts_with("--") {
+            return Err(format!("unknown option `{arg}`"));
+        } else {
+            positional.push(arg);
+        }
+    }
+    let mut positional = positional.into_iter();
+    let Some(path) = positional.next() else {
+        return Err("expected a markdown file or directory".to_string());
+    };
+    Ok(Args {
+        path: PathBuf::from(path),
+        addr: positional
+            .next()
+            .unwrap_or_else(|| DEFAULT_ADDR.to_string()),
+        script,
+    })
+}
 
 fn main() {
-    let mut args = env::args().skip(1);
-    let Some(path) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: mdreader <file.md|dir> [addr]");
+    let Args { path, addr, script } = parse_args(env::args().skip(1)).unwrap_or_else(|err| {
+        eprintln!("mdreader: {err}");
+        eprintln!("{USAGE}");
         process::exit(2);
-    };
-    let addr = args.next().unwrap_or_else(|| DEFAULT_ADDR.to_string());
+    });
 
     let path = fs::canonicalize(&path).unwrap_or_else(|err| {
         eprintln!("mdreader: cannot read {}: {err}", path.display());
@@ -31,17 +72,28 @@ fn main() {
     });
     let is_dir = path.is_dir();
 
+    // Fail now rather than on every page if the script cannot be read.
+    if let Some(script) = &script
+        && let Err(err) = fs::read_to_string(script)
+    {
+        eprintln!("mdreader: cannot read {}: {err}", script.display());
+        process::exit(1);
+    }
+
     let server = Server::http(&addr).unwrap_or_else(|err| {
         eprintln!("mdreader: cannot listen on {addr}: {err}");
         process::exit(1);
     });
     println!("Serving {} at http://{addr}/", path.display());
 
+    let script = script.as_deref();
     for request in server.incoming_requests() {
-        let response = if is_dir {
-            serve_dir(&path, &request)
+        let response = if url_path(request.url()) == SCRIPT_URL {
+            script_response(script)
+        } else if is_dir {
+            serve_dir(&path, &request, script)
         } else {
-            serve_file(&path, &request)
+            serve_file(&path, &request, script)
         };
         if let Err(err) = request.respond(response) {
             eprintln!("mdreader: failed to respond: {err}");
@@ -49,7 +101,11 @@ fn main() {
     }
 }
 
-fn serve_file(path: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
+fn serve_file(
+    path: &Path,
+    request: &Request,
+    script: Option<&Path>,
+) -> Response<io::Cursor<Vec<u8>>> {
     if url_path(request.url()) != "/" {
         return text_response("not found".to_string(), 404);
     }
@@ -57,16 +113,27 @@ fn serve_file(path: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
         Ok(markdown) => markdown,
         Err(err) => return text_response(format!("cannot read {}: {err}", path.display()), 500),
     };
-    let etag_of = |markdown: &str| etag(markdown);
+    let script = script_tag(script);
+    let etag_of = |markdown: &str| etag((&script, markdown));
     if *request.method() == Method::Post {
         return toggle_task_response(path, request, &markdown, etag_of);
     }
     page_response(request, etag_of(&markdown), |etag| {
-        render_page(&display_name(path), &render_markdown(&markdown), None, etag)
+        render_page(
+            &display_name(path),
+            &render_markdown(&markdown),
+            None,
+            script.as_deref(),
+            etag,
+        )
     })
 }
 
-fn serve_dir(root: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
+fn serve_dir(
+    root: &Path,
+    request: &Request,
+    script: Option<&Path>,
+) -> Response<io::Cursor<Vec<u8>>> {
     let tree = match read_tree(root, "") {
         Ok(tree) => tree,
         Err(err) => return text_response(format!("cannot read {}: {err}", root.display()), 500),
@@ -78,15 +145,16 @@ fn serve_dir(root: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
     };
     let current = current.strip_prefix('/').unwrap_or(&current);
 
+    let script = script_tag(script);
     if current.is_empty() {
-        return page_response(request, etag(&tree), |etag| {
+        return page_response(request, etag((&script, &tree)), |etag| {
             let body = if tree.is_empty() {
                 "<p>No markdown files found.</p>\n"
             } else {
                 "<p>Select a file from the sidebar.</p>\n"
             };
             let sidebar = render_sidebar(&title, &tree, None);
-            render_page(&title, body, Some(&sidebar), etag)
+            render_page(&title, body, Some(&sidebar), script.as_deref(), etag)
         });
     }
 
@@ -100,7 +168,7 @@ fn serve_dir(root: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
         Ok(markdown) => markdown,
         Err(err) => return text_response(format!("cannot read {}: {err}", file.display()), 500),
     };
-    let etag_of = |markdown: &str| etag((&tree, markdown));
+    let etag_of = |markdown: &str| etag((&script, &tree, markdown));
     if *request.method() == Method::Post {
         return toggle_task_response(&file, request, &markdown, etag_of);
     }
@@ -110,6 +178,7 @@ fn serve_dir(root: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
             &display_name(&file),
             &render_markdown(&markdown),
             Some(&sidebar),
+            script.as_deref(),
             etag,
         )
     })
@@ -137,9 +206,38 @@ fn page_response(
 
 /// Identifies a page version by hashing everything it is rendered from.
 fn etag(source: impl Hash) -> String {
+    format!("\"{}\"", hash(source))
+}
+
+fn hash(source: impl Hash) -> String {
     let mut hasher = DefaultHasher::new();
     source.hash(&mut hasher);
-    format!("\"{:016x}\"", hasher.finish())
+    format!("{:016x}", hasher.finish())
+}
+
+/// Returns the tag that loads the custom script into a page, or `None` without one. The tag names
+/// the version of the script it was built for, so that editing the script changes the page, which
+/// reloads the pages holding the older one, and the browser fetches the script again instead of
+/// reusing the one it has cached.
+fn script_tag(script: Option<&Path>) -> Option<String> {
+    let version = hash(fs::read_to_string(script?).ok());
+    Some(format!(
+        "<script type=\"module\" src=\"{SCRIPT_URL}?v={version}\" data-mdreader-script></script>\n"
+    ))
+}
+
+/// Serves the custom script named by `--script`, read fresh so that editing it takes effect.
+fn script_response(script: Option<&Path>) -> Response<io::Cursor<Vec<u8>>> {
+    let Some(script) = script else {
+        return text_response("not found".to_string(), 404);
+    };
+    match fs::read_to_string(script) {
+        Ok(source) => with_content_type(
+            Response::from_string(source),
+            "text/javascript; charset=utf-8",
+        ),
+        Err(err) => text_response(format!("cannot read {}: {err}", script.display()), 500),
+    }
 }
 
 /// Checks an `If-None-Match` header value, a comma-separated list of entity tags or `*`.
@@ -305,8 +403,9 @@ fn push_tree(out: &mut String, nodes: &[Node], current: Option<&str>) {
 
 /// Renders markdown to HTML. Headings get an `id` and a `#` link to themselves. Fenced code blocks
 /// whose info string names a supported language are syntax highlighted, `mermaid` blocks are left
-/// for `page.html` to draw as diagrams, and other code blocks are rendered as plain text. Task list
-/// checkboxes are numbered in document order, the way `toggle_task` counts them.
+/// for `page.html` to draw as diagrams, and other code blocks are rendered as plain text. A block
+/// with an info string also gets a `lang-<name>` class, which a custom script can render itself.
+/// Task list checkboxes are numbered in document order, the way `toggle_task` counts them.
 fn render_markdown(markdown: &str) -> String {
     let mut parser = Parser::new_ext(markdown, Options::all());
     let mut events = Vec::new();
@@ -385,20 +484,16 @@ fn render_markdown(markdown: &str) -> String {
             continue;
         }
 
-        match highlight::highlight(lang, &code) {
-            Some(highlighted) => {
-                let html = format!(
-                    "<pre><code class=\"language-{}\">{highlighted}</code></pre>\n",
-                    escape_html(lang)
-                );
-                events.push(Event::Html(html.into()));
-            }
-            None => events.extend([
-                event,
-                Event::Text(code.into()),
-                Event::End(TagEnd::CodeBlock),
-            ]),
-        }
+        // The `lang-*` class on the block is what a custom script looks for to render it itself.
+        let code = match highlight::highlight(lang, &code) {
+            Some(highlighted) => highlighted,
+            None => escape_html(&code),
+        };
+        let lang = escape_html(lang);
+        let html = format!(
+            "<pre class=\"lang-{lang}\"><code class=\"language-{lang}\">{code}</code></pre>\n"
+        );
+        events.push(Event::Html(html.into()));
     }
 
     let mut body = String::new();
@@ -462,9 +557,16 @@ fn unique_id(ids: &mut HashSet<String>, slug: String) -> String {
     id
 }
 
-/// Fills the `{{title}}`, `{{etag}}`, `{{sidebar}}` and `{{body}}` placeholders of `page.html` in
-/// a single pass, so placeholder-like text inside the substituted values is left untouched.
-fn render_page(title: &str, body: &str, sidebar: Option<&str>, etag: &str) -> String {
+/// Fills the `{{title}}`, `{{etag}}`, `{{sidebar}}`, `{{body}}` and `{{script}}` placeholders of
+/// `page.html` in a single pass, so placeholder-like text inside the substituted values is left
+/// untouched.
+fn render_page(
+    title: &str,
+    body: &str,
+    sidebar: Option<&str>,
+    script: Option<&str>,
+    etag: &str,
+) -> String {
     let title = escape_html(title);
     let mut out = String::with_capacity(PAGE_TEMPLATE.len() + body.len());
     let mut rest = PAGE_TEMPLATE;
@@ -479,6 +581,7 @@ fn render_page(title: &str, body: &str, sidebar: Option<&str>, etag: &str) -> St
             "etag" => out.push_str(&escape_html(etag)),
             "sidebar" => out.push_str(sidebar.unwrap_or_default()),
             "body" => out.push_str(body),
+            "script" => out.push_str(script.unwrap_or_default()),
             name => panic!("unknown placeholder `{name}` in page.html"),
         }
         rest = &after[end + 2..];
@@ -566,6 +669,65 @@ fn with_content_type(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_args() {
+        let parse = |args: &[&str]| parse_args(args.iter().map(|arg| arg.to_string()));
+        let args = parse(&["notes"]).expect("valid");
+        assert_eq!(args.path, Path::new("notes"));
+        assert_eq!(args.addr, DEFAULT_ADDR);
+        assert_eq!(args.script, None);
+
+        let args = parse(&["notes", "0.0.0.0:9000", "--script", "r.js"]).expect("valid");
+        assert_eq!(args.path, Path::new("notes"));
+        assert_eq!(args.addr, "0.0.0.0:9000");
+        assert_eq!(args.script.as_deref(), Some(Path::new("r.js")));
+
+        let args = parse(&["--script=r.js", "notes"]).expect("valid");
+        assert_eq!(args.path, Path::new("notes"));
+        assert_eq!(args.script.as_deref(), Some(Path::new("r.js")));
+
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["notes", "--script"]).is_err());
+        assert!(parse(&["--render", "notes"]).is_err());
+    }
+
+    #[test]
+    fn marks_code_blocks_with_their_language() {
+        let html = render_markdown(
+            "```chart
+Rust: 1 < 2
+```
+
+```
+plain
+```
+",
+        );
+        assert_eq!(
+            html,
+            "<pre class=\"lang-chart\"><code class=\"language-chart\">\
+             Rust: 1 &lt; 2\n</code></pre>\n\
+             <pre><code>plain\n</code></pre>\n"
+        );
+    }
+
+    #[test]
+    fn loads_the_custom_script_only_when_there_is_one() {
+        assert_eq!(script_tag(None), None);
+
+        let tag = script_tag(Some(Path::new("examples/custom-script.js"))).expect("a tag");
+        assert!(tag.starts_with(&format!("<script type=\"module\" src=\"{SCRIPT_URL}?v=")));
+        assert!(tag.contains("data-mdreader-script"));
+        // The version names the contents, so an edited script gives a different tag.
+        assert_ne!(
+            script_tag(Some(Path::new("no/such/script.js"))),
+            Some(tag.clone())
+        );
+
+        let page = render_page("t", "", None, Some(&tag), "\"0\"");
+        assert!(page.contains(&tag));
+    }
 
     #[test]
     fn renders_mermaid_blocks_for_the_browser() {
