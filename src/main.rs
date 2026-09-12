@@ -259,7 +259,8 @@ fn contains_file(nodes: &[Node], path: &str) -> bool {
 }
 
 fn render_sidebar(title: &str, tree: &[Node], current: Option<&str>) -> String {
-    // The hamburger button only shows on narrow screens, where the tree starts collapsed.
+    // The hamburger button only shows on narrow screens, where the tree starts collapsed. The
+    // resizer after the sidebar only shows on wide screens.
     let mut out = format!(
         "<nav class=\"sidebar\">\n<div class=\"sidebar-header\">\n\
          <button class=\"menu-toggle\" type=\"button\" aria-label=\"Toggle file list\" \
@@ -272,7 +273,10 @@ fn render_sidebar(title: &str, tree: &[Node], current: Option<&str>) -> String {
         escape_html(title)
     );
     push_tree(&mut out, tree, current);
-    out.push_str("</div>\n</nav>\n");
+    out.push_str(
+        "</div>\n</nav>\n\
+         <div class=\"sidebar-resizer\" role=\"separator\" aria-orientation=\"vertical\"></div>\n",
+    );
     out
 }
 
