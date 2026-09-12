@@ -6,11 +6,16 @@
     <meta name="mdreader-etag" content="{{etag}}" />
     <title>{{title}}</title>
     <script>
-      // Apply the saved theme before the page renders to avoid a flash of the wrong theme.
+      // Apply the saved theme and sidebar width before the page renders to avoid a flash of the
+      // wrong ones.
       try {
         const theme = localStorage.getItem("mdreader-theme");
         if (theme === "light" || theme === "dark") {
           document.documentElement.dataset.theme = theme;
+        }
+        const sidebarWidth = Number(localStorage.getItem("mdreader-sidebar-width"));
+        if (sidebarWidth > 0) {
+          document.documentElement.style.setProperty("--sidebar-width", `${sidebarWidth}px`);
         }
       } catch {}
     </script>
@@ -167,7 +172,7 @@
         }
       }
       .sidebar {
-        flex: 0 0 16rem;
+        flex: 0 0 clamp(10rem, var(--sidebar-width, 16rem), 50vw);
         box-sizing: border-box;
         position: sticky;
         top: 0;
@@ -243,8 +248,25 @@
       .sidebar .dir {
         color: var(--muted);
       }
+      /* A strip over the sidebar's border, taking no space of its own, that drags to resize it. */
+      .sidebar-resizer {
+        display: none;
+        flex: none;
+        position: sticky;
+        top: 0;
+        width: 0.5rem;
+        height: 100vh;
+        margin-inline: -0.25rem;
+        cursor: col-resize;
+        touch-action: none;
+      }
+      .sidebar-resizer:hover,
+      .sidebar-resizer.resizing {
+        background: linear-gradient(var(--accent), var(--accent)) center / 2px 100% no-repeat;
+      }
       @media (scripting: enabled) {
-        .theme-toggle {
+        .theme-toggle,
+        .sidebar-resizer {
           display: block;
         }
       }
@@ -265,6 +287,9 @@
           padding: 0.5rem 1rem;
           border-right: 0;
           border-bottom: 1px solid var(--border);
+        }
+        .sidebar-resizer {
+          display: none;
         }
         .sidebar-tree a,
         .sidebar-tree .dir {
@@ -333,6 +358,42 @@
           const open = button.getAttribute("aria-expanded") !== "true";
           button.setAttribute("aria-expanded", open);
           button.closest(".sidebar").classList.toggle("open", open);
+        });
+      }
+
+      // Dragging the resizer sets the sidebar width, which is remembered for every page.
+      // Double-clicking it restores the default width.
+      const sidebarResizer = document.querySelector(".sidebar-resizer");
+      if (sidebarResizer) {
+        const sidebar = document.querySelector(".sidebar");
+        const root = document.documentElement;
+        sidebarResizer.addEventListener("pointerdown", (event) => {
+          if (event.button !== 0) return;
+          // Keep the drag from selecting text.
+          event.preventDefault();
+          sidebarResizer.setPointerCapture(event.pointerId);
+        });
+        sidebarResizer.addEventListener("pointermove", (event) => {
+          if (!sidebarResizer.hasPointerCapture(event.pointerId)) return;
+          sidebarResizer.classList.add("resizing");
+          const width = event.clientX - sidebar.getBoundingClientRect().left;
+          root.style.setProperty("--sidebar-width", `${width}px`);
+        });
+        sidebarResizer.addEventListener("lostpointercapture", () => {
+          if (!sidebarResizer.classList.contains("resizing")) return;
+          sidebarResizer.classList.remove("resizing");
+          // Save the width the sidebar is limited to, not where the pointer was let go.
+          const width = Math.round(sidebar.getBoundingClientRect().width);
+          root.style.setProperty("--sidebar-width", `${width}px`);
+          try {
+            localStorage.setItem("mdreader-sidebar-width", width);
+          } catch {}
+        });
+        sidebarResizer.addEventListener("dblclick", () => {
+          root.style.removeProperty("--sidebar-width");
+          try {
+            localStorage.removeItem("mdreader-sidebar-width");
+          } catch {}
         });
       }
 
