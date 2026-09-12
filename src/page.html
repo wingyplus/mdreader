@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="mdreader-etag" content="{{etag}}" />
+    <meta name="mdreader-assets" content="{{assets}}" />
     <title>{{title}}</title>
     <script>
       // Apply the saved theme and sidebar width before the page renders to avoid a flash of the
@@ -327,6 +328,7 @@
         }
       }
     </style>
+    {{styles}}
   </head>
   <body>
     {{sidebar}}
@@ -491,6 +493,15 @@
       // Replaces the content and file tree with those of a newer version of the page, keeping the
       // scroll position and the sidebar state.
       const updatePage = (page) => {
+        // Injected styles and scripts only take effect as the page loads, and a script adopted from
+        // a parsed document never runs, so a change to them needs a reload rather than a swap.
+        const assets = document.querySelector('meta[name="mdreader-assets"]');
+        const newAssets = page.querySelector('meta[name="mdreader-assets"]');
+        if (assets && newAssets && assets.content !== newAssets.content) {
+          location.reload();
+          return;
+        }
+
         document.title = page.title;
         const tree = document.querySelector(".sidebar-tree");
         const newTree = page.querySelector(".sidebar-tree");
@@ -578,5 +589,6 @@
         });
       });
     </script>
+    {{scripts}}
   </body>
 </html>

@@ -18,18 +18,44 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 const PAGE_TEMPLATE: &str = include_str!("page.html");
 
 fn main() {
+    let mut positional = Vec::new();
+    let mut injected = Vec::new();
     let mut args = env::args().skip(1);
-    let Some(path) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: mdreader <file.md|dir> [addr]");
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--inject=") {
+            injected.push(PathBuf::from(value));
+        } else if arg == "--inject" {
+            let Some(value) = args.next() else {
+                eprintln!("mdreader: --inject needs a file");
+                process::exit(2);
+            };
+            injected.push(PathBuf::from(value));
+        } else {
+            positional.push(arg);
+        }
+    }
+
+    let mut positional = positional.into_iter();
+    let Some(path) = positional.next().map(PathBuf::from) else {
+        eprintln!("usage: mdreader <file.md|dir> [addr] [--inject <file.css|file.js>]...");
         process::exit(2);
     };
-    let addr = args.next().unwrap_or_else(|| DEFAULT_ADDR.to_string());
+    let addr = positional
+        .next()
+        .unwrap_or_else(|| DEFAULT_ADDR.to_string());
 
     let path = fs::canonicalize(&path).unwrap_or_else(|err| {
         eprintln!("mdreader: cannot read {}: {err}", path.display());
         process::exit(1);
     });
     let is_dir = path.is_dir();
+
+    // Fail before serving, rather than on the first request, if a file cannot be read or holds
+    // something that cannot be embedded in the page.
+    if let Err(err) = read_assets(&injected) {
+        eprintln!("mdreader: {err}");
+        process::exit(1);
+    }
 
     let server = Server::http(&addr).unwrap_or_else(|err| {
         eprintln!("mdreader: cannot listen on {addr}: {err}");
@@ -39,9 +65,9 @@ fn main() {
 
     for request in server.incoming_requests() {
         let response = if is_dir {
-            serve_dir(&path, &request)
+            serve_dir(&path, &injected, &request)
         } else {
-            serve_file(&path, &request)
+            serve_file(&path, &injected, &request)
         };
         if let Err(err) = request.respond(response) {
             eprintln!("mdreader: failed to respond: {err}");
@@ -49,7 +75,11 @@ fn main() {
     }
 }
 
-fn serve_file(path: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
+fn serve_file(
+    path: &Path,
+    injected: &[PathBuf],
+    request: &Request,
+) -> Response<io::Cursor<Vec<u8>>> {
     if url_path(request.url()) != "/" {
         return text_response("not found".to_string(), 404);
     }
@@ -57,19 +87,39 @@ fn serve_file(path: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
         Ok(markdown) => markdown,
         Err(err) => return text_response(format!("cannot read {}: {err}", path.display()), 500),
     };
-    let etag_of = |markdown: &str| etag(markdown);
+    // Read again for every page, so editing an injected file shows up like editing the markdown.
+    let assets = match read_assets(injected) {
+        Ok(assets) => assets,
+        Err(err) => return text_response(err, 500),
+    };
+    let etag_of = |markdown: &str| etag((&assets, markdown));
     if *request.method() == Method::Post {
         return toggle_task_response(path, request, &markdown, etag_of);
     }
     page_response(request, etag_of(&markdown), |etag| {
-        render_page(&display_name(path), &render_markdown(&markdown), None, etag)
+        render_page(
+            &display_name(path),
+            &render_markdown(&markdown),
+            None,
+            etag,
+            &assets,
+        )
     })
 }
 
-fn serve_dir(root: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
+fn serve_dir(
+    root: &Path,
+    injected: &[PathBuf],
+    request: &Request,
+) -> Response<io::Cursor<Vec<u8>>> {
     let tree = match read_tree(root, "") {
         Ok(tree) => tree,
         Err(err) => return text_response(format!("cannot read {}: {err}", root.display()), 500),
+    };
+    // Read again for every page, so editing an injected file shows up like editing the markdown.
+    let assets = match read_assets(injected) {
+        Ok(assets) => assets,
+        Err(err) => return text_response(err, 500),
     };
     let title = display_name(root);
 
@@ -79,14 +129,14 @@ fn serve_dir(root: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
     let current = current.strip_prefix('/').unwrap_or(&current);
 
     if current.is_empty() {
-        return page_response(request, etag(&tree), |etag| {
+        return page_response(request, etag((&tree, &assets)), |etag| {
             let body = if tree.is_empty() {
                 "<p>No markdown files found.</p>\n"
             } else {
                 "<p>Select a file from the sidebar.</p>\n"
             };
             let sidebar = render_sidebar(&title, &tree, None);
-            render_page(&title, body, Some(&sidebar), etag)
+            render_page(&title, body, Some(&sidebar), etag, &assets)
         });
     }
 
@@ -100,7 +150,7 @@ fn serve_dir(root: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
         Ok(markdown) => markdown,
         Err(err) => return text_response(format!("cannot read {}: {err}", file.display()), 500),
     };
-    let etag_of = |markdown: &str| etag((&tree, markdown));
+    let etag_of = |markdown: &str| etag((&tree, &assets, markdown));
     if *request.method() == Method::Post {
         return toggle_task_response(&file, request, &markdown, etag_of);
     }
@@ -111,6 +161,7 @@ fn serve_dir(root: &Path, request: &Request) -> Response<io::Cursor<Vec<u8>>> {
             &render_markdown(&markdown),
             Some(&sidebar),
             etag,
+            &assets,
         )
     })
 }
@@ -256,6 +307,54 @@ fn contains_file(nodes: &[Node], path: &str) -> bool {
         Node::Dir { children, .. } => contains_file(children, path),
         Node::File { path: file, .. } => file == path,
     })
+}
+
+/// The CSS and JavaScript given with `--inject`, embedded in every page so the reader can be
+/// extended — with custom element definitions, for example — without rebuilding.
+#[derive(Debug, Default, Hash)]
+struct Assets {
+    styles: Vec<String>,
+    scripts: Vec<String>,
+}
+
+impl Assets {
+    /// Identifies this set of files, so a page can tell that they changed and reload itself.
+    fn fingerprint(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+}
+
+/// Reads the files given with `--inject`. A `.css` file becomes a `<style>` and a `.js` file a
+/// `<script type="module">`, which lets injected code `import` the way `page.html` does. The files
+/// are embedded in the page rather than served, so every URL this server answers stays a markdown
+/// file, and their contents are part of the page's entity tag, so editing one reloads the page.
+fn read_assets(paths: &[PathBuf]) -> Result<Assets, String> {
+    let mut assets = Assets::default();
+    for path in paths {
+        let content = fs::read_to_string(path)
+            .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+        let extension = path
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        let (bucket, closing) = match extension.as_str() {
+            "css" => (&mut assets.styles, "</style"),
+            "js" => (&mut assets.scripts, "</script"),
+            _ => return Err(format!("{}: expected a .css or .js file", path.display())),
+        };
+        // The file is embedded as written, so a closing tag inside it would end the element early.
+        if content.to_lowercase().contains(closing) {
+            return Err(format!(
+                "{}: cannot embed a file containing `{closing}`",
+                path.display()
+            ));
+        }
+        bucket.push(content);
+    }
+    Ok(assets)
 }
 
 fn render_sidebar(title: &str, tree: &[Node], current: Option<&str>) -> String {
@@ -466,9 +565,16 @@ fn unique_id(ids: &mut HashSet<String>, slug: String) -> String {
     id
 }
 
-/// Fills the `{{title}}`, `{{etag}}`, `{{sidebar}}` and `{{body}}` placeholders of `page.html` in
-/// a single pass, so placeholder-like text inside the substituted values is left untouched.
-fn render_page(title: &str, body: &str, sidebar: Option<&str>, etag: &str) -> String {
+/// Fills the `{{title}}`, `{{etag}}`, `{{assets}}`, `{{sidebar}}`, `{{styles}}`, `{{scripts}}` and
+/// `{{body}}` placeholders of `page.html` in a single pass, so placeholder-like text inside the
+/// substituted values — injected JavaScript especially — is left untouched.
+fn render_page(
+    title: &str,
+    body: &str,
+    sidebar: Option<&str>,
+    etag: &str,
+    assets: &Assets,
+) -> String {
     let title = escape_html(title);
     let mut out = String::with_capacity(PAGE_TEMPLATE.len() + body.len());
     let mut rest = PAGE_TEMPLATE;
@@ -481,7 +587,18 @@ fn render_page(title: &str, body: &str, sidebar: Option<&str>, etag: &str) -> St
         match &after[..end] {
             "title" => out.push_str(&title),
             "etag" => out.push_str(&escape_html(etag)),
+            "assets" => out.push_str(&assets.fingerprint()),
             "sidebar" => out.push_str(sidebar.unwrap_or_default()),
+            "styles" => {
+                for style in &assets.styles {
+                    let _ = write!(out, "<style>\n{style}</style>\n");
+                }
+            }
+            "scripts" => {
+                for script in &assets.scripts {
+                    let _ = write!(out, "<script type=\"module\">\n{script}</script>\n");
+                }
+            }
             "body" => out.push_str(body),
             name => panic!("unknown placeholder `{name}` in page.html"),
         }
@@ -629,6 +746,81 @@ mod tests {
             Some("- [ ] one\n  - [X] two\n\n  text\n\n1. [ ] three\n")
         );
         assert_eq!(toggle_task(markdown, 3, true), None);
+    }
+
+    #[test]
+    fn embeds_injected_files_in_the_page() {
+        let assets = Assets {
+            styles: vec!["my-callout { color: red }\n".to_string()],
+            scripts: vec!["customElements.define(\"my-callout\", Callout);\n".to_string()],
+        };
+        let page = render_page("Doc", "<p>body</p>\n", None, "\"00ff\"", &assets);
+        assert!(page.contains("<style>\nmy-callout { color: red }\n</style>"));
+        assert!(page.contains(
+            "<script type=\"module\">\ncustomElements.define(\"my-callout\", Callout);\n</script>"
+        ));
+        assert!(page.contains(&format!(
+            "<meta name=\"mdreader-assets\" content=\"{}\" />",
+            assets.fingerprint()
+        )));
+    }
+
+    /// Injected JavaScript is substituted in, not scanned, so braces in it are left as written.
+    fn injected(script: &str) -> String {
+        let assets = Assets {
+            styles: Vec::new(),
+            scripts: vec![script.to_string()],
+        };
+        render_page("Doc", "", None, "\"00ff\"", &assets)
+    }
+
+    #[test]
+    fn leaves_placeholder_like_text_in_injected_code_alone() {
+        assert!(injected("const a = {{ x: 1 }};\n").contains("const a = {{ x: 1 }};"));
+        assert!(injected("const b = `{{body}}`;\n").contains("const b = `{{body}}`;"));
+    }
+
+    #[test]
+    fn fingerprints_change_with_the_injected_files() {
+        let one = Assets {
+            styles: vec!["a{}".to_string()],
+            scripts: Vec::new(),
+        };
+        let two = Assets {
+            styles: vec!["b{}".to_string()],
+            scripts: Vec::new(),
+        };
+        assert_ne!(one.fingerprint(), two.fingerprint());
+        assert_eq!(one.fingerprint(), one.fingerprint());
+    }
+
+    #[test]
+    fn rejects_files_it_cannot_embed() {
+        let dir = env::temp_dir().join(format!("mdreader-assets-{}", process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+
+        let other = dir.join("thing.txt");
+        fs::write(&other, "x").expect("write");
+        assert!(
+            read_assets(&[other])
+                .unwrap_err()
+                .contains("expected a .css or .js file")
+        );
+
+        // A closing tag in the file would end the element it is embedded in.
+        let breaks_out = dir.join("bad.js");
+        fs::write(&breaks_out, "const s = \"</SCRIPT>\";\n").expect("write");
+        assert!(read_assets(&[breaks_out]).unwrap_err().contains("</script"));
+
+        let style = dir.join("good.css");
+        fs::write(&style, "a { color: red }\n").expect("write");
+        let script = dir.join("good.js");
+        fs::write(&script, "export const x = 1;\n").expect("write");
+        let assets = read_assets(&[style, script]).expect("assets");
+        assert_eq!(assets.styles, ["a { color: red }\n"]);
+        assert_eq!(assets.scripts, ["export const x = 1;\n"]);
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
